@@ -14,18 +14,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
 
 var (
-	// mux is the HTTP request multiplexer used with the test server.
-	mux *http.ServeMux
-
 	// client is the API client being tested.
-	client *API
+	client *Client
 
 	// server is a test HTTP server used to provide mock API responses.
 	server *httptest.Server
+
+	// router is the HTTP request router used with the test server.
+	router *gin.Engine
 )
 
 const (
@@ -35,12 +36,14 @@ const (
 
 func setup(opts ...Option) {
 	// test server
-	mux = http.NewServeMux()
-	server = httptest.NewServer(mux)
+	gin.SetMode(gin.ReleaseMode)
+	router = gin.New()
+	router.Use(gin.Recovery())
+	server = httptest.NewServer(router)
 
 	// ZeroGate client configured to use test server
 	client, _ = New(testApiKey, testApiSecret, opts...)
-	client.BaseURL = server.URL
+	client.baseUrl = server.URL
 }
 
 func teardown() {
@@ -50,25 +53,29 @@ func teardown() {
 func TestClient_Headers(t *testing.T) {
 	// it should set default headers
 	setup()
-	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodGet, r.Method, "Expected method 'GET', got %s", r.Method)
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
-		testSignature(r, t)
+	router.GET("/get", func(c *gin.Context) {
+		assert.Equal(t, http.MethodGet, c.Request.Method, "Expected method 'GET', got %s", c.Request.Method)
+		assert.Equal(t, "application/json", c.Request.Header.Get("Content-Type"))
+		testSignature(c, t)
+		c.JSON(http.StatusOK, "ok")
 	})
-	mux.HandleFunc("/post", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPost, r.Method, "Expected method 'GET', got %s", r.Method)
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
-		testSignature(r, t)
+	router.POST("/post", func(c *gin.Context) {
+		assert.Equal(t, http.MethodPost, c.Request.Method, "Expected method 'POST', got %s", c.Request.Method)
+		assert.Equal(t, "application/json", c.Request.Header.Get("Content-Type"))
+		testSignature(c, t)
+		c.JSON(http.StatusOK, "ok")
 	})
-	mux.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPut, r.Method, "Expected method 'GET', got %s", r.Method)
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
-		testSignature(r, t)
+	router.PUT("/put", func(c *gin.Context) {
+		assert.Equal(t, http.MethodPut, c.Request.Method, "Expected method 'PUT', got %s", c.Request.Method)
+		assert.Equal(t, "application/json", c.Request.Header.Get("Content-Type"))
+		testSignature(c, t)
+		c.JSON(http.StatusOK, "ok")
 	})
-	mux.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodDelete, r.Method, "Expected method 'GET', got %s", r.Method)
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
-		testSignature(r, t)
+	router.DELETE("/delete", func(c *gin.Context) {
+		assert.Equal(t, http.MethodDelete, c.Request.Method, "Expected method 'DELETE', got %s", c.Request.Method)
+		assert.Equal(t, "application/json", c.Request.Header.Get("Content-Type"))
+		testSignature(c, t)
+		c.JSON(http.StatusOK, "ok")
 	})
 	header := make(http.Header)
 	client.doRequest(context.Background(), http.MethodGet, "/get", nil, nil, header)
@@ -78,15 +85,16 @@ func TestClient_Headers(t *testing.T) {
 	teardown()
 }
 
-func testSignature(r *http.Request, t *testing.T) {
+func testSignature(c *gin.Context, t *testing.T) {
 	// Get the authorization header
-	authHeader := r.Header.Get("Authorization")
+	authHeader := c.Request.Header.Get("Authorization")
 	assert.NotEmpty(t, authHeader, "empty Authorization header")
 
 	// Split the authorization header into its components
 	authParts := strings.Split(authHeader, ", ")
 	if len(authParts) != 3 {
-		assert.Error(t, nil, "invalid Authorization header")
+		assert.NoError(t, nil, "invalid Authorization header")
+		return
 	}
 
 	// Parse the authorization header for the API key, signature, and nonce
@@ -94,31 +102,35 @@ func testSignature(r *http.Request, t *testing.T) {
 	var nonce int64
 
 	if n, err := fmt.Sscanf(authParts[0], "APIKey=%s", &apiKey); err != nil || n != 1 {
-		assert.Error(t, err, "invalid Authorization header")
+		assert.NoError(t, err, "invalid Authorization header")
+		return
 	}
 	if n, err := fmt.Sscanf(authParts[1], "Signature=%s", &signature); err != nil || n != 1 {
-		assert.Error(t, err, "invalid Authorization header")
+		assert.NoError(t, err, "invalid Authorization header")
+		return
 	}
 	if n, err := fmt.Sscanf(authParts[2], "Nonce=%d", &nonce); err != nil || n != 1 {
-		assert.Error(t, err, "invalid Authorization header")
+		assert.NoError(t, err, "invalid Authorization header")
+		return
 	}
 
 	// Combine the HTTP method, endpoint, nonce, and request body into the message to sign
-	method := r.Method
-	endpoint := r.URL.Path
+	method := c.Request.Method
+	endpoint := c.Request.URL.Path
 	message := method + endpoint + fmt.Sprint(nonce)
 
 	// Create an HMAC-SHA512 hash using the API secret as the key
 	h := hmac.New(sha512.New, []byte(testApiSecret))
 	h.Write([]byte(message))
 	if method == http.MethodPost || method == http.MethodPut {
-		bodyBytes, err := io.ReadAll(r.Body)
+		bodyBytes, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			assert.Error(t, err, "error reading body")
+			assert.NoError(t, err, "error reading body")
+			return
 		}
-		r.Body.Close() //  must close
+		c.Request.Body.Close() //  must close
 		h.Write(bodyBytes)
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 	}
 	reqSignature := hex.EncodeToString(h.Sum(nil))
 
@@ -129,10 +141,11 @@ func TestContextTimeout(t *testing.T) {
 	setup()
 	defer teardown()
 
-	handler := func(w http.ResponseWriter, r *http.Request) {
+	handler := func(c *gin.Context) {
 		time.Sleep(3 * time.Second)
+		c.JSON(http.StatusOK, "ok")
 	}
-	mux.HandleFunc("/timeout", handler)
+	router.GET("/timeout", handler)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

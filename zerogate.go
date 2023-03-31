@@ -15,46 +15,59 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"sync"
 	"time"
 )
 
-// API holds the configuration for the current API client.
-type API struct {
-	APIKey     string
-	APISecret  string
-	BaseURL    string
-	Debug      bool
-	UserAgent  string
+type service struct {
+	client *Client
+}
+
+// Client holds the configuration for the current API client.
+type Client struct {
+	mutex      sync.RWMutex
+	apiKey     string
+	apiSecret  string
+	baseUrl    string
+	debug      bool
+	userAgent  string
 	headers    http.Header
 	httpClient *http.Client
 	logger     *log.Logger
+
+	common service
+
+	Tenant *TenantService
 }
 
 // newClient provides shared logic for New.
-func newClient(opts ...Option) (*API, error) {
+func newClient(opts ...Option) (*Client, error) {
 	silentLogger := log.New(io.Discard, "", log.LstdFlags)
 
-	api := &API{
-		BaseURL:   baseUrl,
-		UserAgent: userAgent,
+	client := &Client{
+		baseUrl:   baseUrl,
+		userAgent: userAgent,
 		headers:   make(http.Header),
 		logger:    silentLogger,
 	}
+	client.common.client = client
 
-	err := api.parseOptions(opts...)
+	err := client.parseOptions(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("options parsing failed: %w", err)
 	}
 
-	if api.httpClient == nil {
-		api.httpClient = http.DefaultClient
+	if client.httpClient == nil {
+		client.httpClient = http.DefaultClient
 	}
 
-	return api, nil
+	client.Tenant = (*TenantService)(&client.common)
+
+	return client, nil
 }
 
 // New creates a new ZeroGate API client.
-func New(key, secret string, opts ...Option) (*API, error) {
+func New(key, secret string, opts ...Option) (*Client, error) {
 	if key == "" || secret == "" {
 		return nil, errors.New(errEmptyCredentials)
 	}
@@ -64,16 +77,33 @@ func New(key, secret string, opts ...Option) (*API, error) {
 		return nil, err
 	}
 
-	api.APIKey = key
-	api.APISecret = secret
+	api.apiKey = key
+	api.apiSecret = secret
 
 	return api, nil
 }
 
-func (api *API) doRequest(ctx context.Context, method, endpoint string, query map[string][]string, body interface{}, headers http.Header) (*APIResponse, error) {
+func (c *Client) getClient() *http.Client {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	httpClient := c.httpClient
+	clientCopy := *httpClient
+	return &clientCopy
+}
+
+func (c *Client) doRequest(ctx context.Context, method, endpoint string, query map[string][]string, body interface{}, headers http.Header) (*APIResponse, error) {
 	var err error
 	var resp *http.Response
 	var respBody []byte
+
+	c.mutex.RLock()
+	apiKey := c.apiKey
+	apiSecret := c.apiSecret
+	baseUrl := c.baseUrl
+	debug := c.debug
+	userAgent := c.userAgent
+	apiHeaders := c.headers
+	c.mutex.RUnlock()
 
 	var reqBody io.Reader
 	if body != nil && (method == http.MethodPost || method == http.MethodPut) {
@@ -92,11 +122,20 @@ func (api *API) doRequest(ctx context.Context, method, endpoint string, query ma
 	} else if method == http.MethodPost || method == http.MethodPut {
 		reqBody = bytes.NewReader([]byte("{}"))
 	}
+	var bodyBytes []byte
+
+	if method == http.MethodPost || method == http.MethodPut {
+		bodyBytes, err = io.ReadAll(reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("error reading body: %w", err)
+		}
+		reqBody = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
 
 	// Get the current datetime in ISO 8601 format
 	now := time.Now().Unix()
 
-	req, err := http.NewRequestWithContext(ctx, method, api.BaseURL+endpoint, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, baseUrl+endpoint, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("ZeroGate request creation failed: %w", err)
 	}
@@ -111,7 +150,7 @@ func (api *API) doRequest(ctx context.Context, method, endpoint string, query ma
 	req.URL.RawQuery = queryString
 
 	combinedHeaders := make(http.Header)
-	for k, v := range api.headers {
+	for k, v := range apiHeaders {
 		combinedHeaders[k] = v
 	}
 	for k, v := range headers {
@@ -123,33 +162,28 @@ func (api *API) doRequest(ctx context.Context, method, endpoint string, query ma
 	message := req.Method + req.URL.Path + fmt.Sprint(now)
 
 	// Create an HMAC-SHA512 hash using the API secret as the key
-	h := hmac.New(sha512.New, []byte(api.APISecret))
+	h := hmac.New(sha512.New, []byte(apiSecret))
 	h.Write([]byte(message))
 	if method == http.MethodPost || method == http.MethodPut {
-		bodyBytes, err := io.ReadAll(reqBody)
-		if err != nil {
-			return nil, fmt.Errorf("error reading body: %w", err)
-		}
 		h.Write(bodyBytes)
-		reqBody = io.NopCloser(bytes.NewBuffer(bodyBytes))
 	}
 	signature := hex.EncodeToString(h.Sum(nil))
 
-	req.Header.Set("Authorization", fmt.Sprintf("APIKey=%s, Signature=%s, Nonce=%d", api.APIKey, signature, now))
-	if api.UserAgent != "" {
-		req.Header.Set("User-Agent", api.UserAgent)
+	req.Header.Set("Authorization", fmt.Sprintf("APIKey=%s, Signature=%s, Nonce=%d", apiKey, signature, now))
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
 	}
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	if api.Debug {
+	if debug {
 		dump, err := httputil.DumpRequestOut(req, true)
 		if err != nil {
 			return nil, err
 		}
 		// strip out any sensitive information from the request payload.
-		sensitiveKeys := []string{api.APIKey, api.APISecret}
+		sensitiveKeys := []string{apiKey, apiSecret}
 		for _, key := range sensitiveKeys {
 			if key != "" {
 				valueRegex := regexp.MustCompile(fmt.Sprintf("(?m)%s", key))
@@ -158,14 +192,13 @@ func (api *API) doRequest(ctx context.Context, method, endpoint string, query ma
 		}
 		log.Printf("\n%s", string(dump))
 	}
-
-	resp, err = api.httpClient.Do(req)
+	client := c.getClient()
+	resp, err = client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ZeroGate request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if api.Debug {
+	if debug {
 		dump, err := httputil.DumpResponse(resp, true)
 		if err != nil {
 			return nil, err
@@ -174,10 +207,39 @@ func (api *API) doRequest(ctx context.Context, method, endpoint string, query ma
 	}
 	respBody, err = io.ReadAll(resp.Body)
 
+	if resp.StatusCode >= http.StatusBadRequest {
+		var r ErrorResponse
+		err = json.Unmarshal(respBody, &r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal response body: %w", err)
+		}
+		err = &Error{
+			StatusCode: resp.StatusCode,
+			Response:   r,
+		}
+		return nil, err
+	}
+
 	return &APIResponse{
 		Body:       respBody,
 		StatusCode: resp.StatusCode,
 		Status:     resp.Status,
 		Headers:    resp.Header,
 	}, nil
+}
+
+func (c *Client) get(ctx context.Context, endpoint string, query map[string][]string, headers http.Header) (*APIResponse, error) {
+	return c.doRequest(ctx, http.MethodGet, endpoint, query, nil, headers)
+}
+
+func (c *Client) post(ctx context.Context, endpoint string, query map[string][]string, body interface{}, headers http.Header) (*APIResponse, error) {
+	return c.doRequest(ctx, http.MethodPost, endpoint, query, body, headers)
+}
+
+func (c *Client) put(ctx context.Context, endpoint string, query map[string][]string, body interface{}, headers http.Header) (*APIResponse, error) {
+	return c.doRequest(ctx, http.MethodPut, endpoint, query, body, headers)
+}
+
+func (c *Client) delete(ctx context.Context, endpoint string, query map[string][]string, headers http.Header) (*APIResponse, error) {
+	return c.doRequest(ctx, http.MethodDelete, endpoint, query, nil, headers)
 }
