@@ -206,6 +206,9 @@ func (c *Client) doRequest(ctx context.Context, method, endpoint string, query m
 		log.Printf("\n%s", string(dump))
 	}
 	respBody, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("response read failed: %w", err)
+	}
 
 	if resp.StatusCode >= http.StatusBadRequest {
 		var r ErrorResponse
